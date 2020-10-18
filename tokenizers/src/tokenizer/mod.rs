@@ -19,7 +19,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::de::DeserializeOwned;
 use serde::export::Formatter;
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,7 @@ pub trait Trainer {
         &self,
         words: HashMap<String, u32>,
     ) -> Result<(<Self as Trainer>::Model, Vec<AddedToken>)>;
+
     /// Process a bunch of token, counting them as relevant.
     fn process_tokens(&self, words: &mut HashMap<String, u32>, tokens: Vec<String>);
 }
@@ -948,33 +950,21 @@ where
     }
 
     /// Train a model and replace our current Model, using the given Trainer
-    fn word_count<MN, T>(&self, trainer: &T, files: Vec<String>) -> Result<HashMap<String, u32>>
+    pub fn word_count<MN, T>(&self, trainer: &T, files: Vec<String>) -> Result<HashMap<String, u32>>
     where
         T: Trainer<Model = MN> + Sync,
         MN: Model,
     {
         let max_read = 1_000_000;
-        let mut len = 0;
-        for file in files.iter() {
-            len += File::open(file)
-                .and_then(|f| f.metadata())
-                .map(|m| m.len())?;
-        }
-
-        let progress = if trainer.should_show_progress() {
-            let progress = ProgressBar::new(len);
-            progress.set_style(
-                ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] {msg:<40!} {wide_bar} {percent:>19!}"),
-            );
-            progress.set_message(&format!("Reading files ({:.2} Mo)", len / 1_000_000));
-            progress.set_draw_delta(len / 100); // Redraw only every 2%
-            Some(progress)
-        } else {
-            None
-        };
+        let num_files = files.len();
+        let progress = ProgressBar::new(num_files as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {msg:<40!} {wide_bar} {percent:>19!}"),
+        );
         let words = files
-            .into_iter()
+            .into_par_iter()
+            .progress_with(progress)
             .map(|filename| -> Result<HashMap<String, u32>> {
                 let file = File::open(filename)?;
                 let file = BufReader::with_capacity(max_read, file);
@@ -982,34 +972,24 @@ where
                 // on purpose. We want to keep the `\n` and potential `\r` between each lines
                 // We use an iterator to be able to chain with par_bridge.
                 file.lines_with_ending()
-                    .maybe_par_bridge()
-                    .map_with(
-                        &progress,
-                        |progress, line| -> Result<HashMap<String, u32>> {
-                            let newline = line?;
-                            let b = newline.len();
-                            let mut words = HashMap::new();
-                            let normalized = self.do_normalize(newline)?;
-                            let pre_tokenized = self.do_pre_tokenize(normalized)?;
-                            trainer.process_tokens(
-                                &mut words,
-                                pre_tokenized
-                                    .get_splits(OffsetReferential::Original, OffsetType::Byte)
-                                    .into_iter()
-                                    .map(|(s, _, _)| s.to_owned())
-                                    .collect(),
-                            );
-
-                            if let Some(pbar) = progress {
-                                pbar.inc(b as u64);
-                            }
-                            Ok(words)
-                        },
-                    )
-                    .reduce(
-                        || Ok(HashMap::new()),
-                        |acc, ws| {
-                            let mut acc = acc?;
+                    .map(|line| -> Result<HashMap<String, u32>> {
+                        let newline = line?;
+                        let mut words = HashMap::new();
+                        let normalized = self.do_normalize(newline)?;
+                        let pre_tokenized = self.do_pre_tokenize(normalized)?;
+                        trainer.process_tokens(
+                            &mut words,
+                            pre_tokenized
+                                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                                .into_iter()
+                                .map(|(s, _, _)| s.to_owned())
+                                .collect(),
+                        );
+                        Ok(words)
+                    })
+                    .try_fold(
+                        HashMap::new(),
+                        |mut acc, ws| -> Result<HashMap<String, u32>> {
                             for (k, v) in ws? {
                                 acc.entry(k).and_modify(|c| *c += v).or_insert(v);
                             }
@@ -1017,19 +997,44 @@ where
                         },
                     )
             })
-            .try_fold(
-                HashMap::new(),
-                |mut acc, ws| -> Result<HashMap<String, u32>> {
+            .reduce(
+                || Ok(HashMap::new()),
+                |acc, ws| {
+                    let mut acc = acc?;
                     for (k, v) in ws? {
                         acc.entry(k).and_modify(|c| *c += v).or_insert(v);
                     }
                     Ok(acc)
                 },
             )?;
-        if let Some(pbar) = progress {
-            pbar.finish();
-        }
         Ok(words)
+    }
+
+    /// Train a model and return a new Tokenizer, using the given Trainer
+    pub fn train_with_counts<T, TM>(
+        self,
+        trainer: &T,
+        words: HashMap<String, u32>,
+    ) -> Result<TokenizerImpl<TM, N, PT, PP, D>>
+    where
+        T: Trainer<Model = TM> + Sync,
+        TM: Model,
+    {
+        let (model, special_tokens) = trainer.train(words)?;
+        let mut new_tok = TokenizerImpl {
+            normalizer: self.normalizer,
+            pre_tokenizer: self.pre_tokenizer,
+            model,
+            post_processor: self.post_processor,
+            decoder: self.decoder,
+            added_vocabulary: self.added_vocabulary,
+            truncation: self.truncation,
+            padding: self.padding,
+        };
+
+        new_tok.add_special_tokens(&special_tokens);
+
+        Ok(new_tok)
     }
 
     /// Train a model and return a new Tokenizer, using the given Trainer

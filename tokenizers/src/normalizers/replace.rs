@@ -104,7 +104,7 @@ mod tests {
         let normalized = "This is a test";
 
         let mut n = NormalizedString::from(original);
-        Replace::new(ReplacePattern::Regex(r"\s+".into()), ' ')
+        Replace::new(ReplacePattern::Regex(r"\s+".into()), " ")
             .unwrap()
             .normalize(&mut n)
             .unwrap();
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&replace).unwrap(), replace_s);
         assert_eq!(serde_json::from_str::<Replace>(replace_s).unwrap(), replace);
 
-        let replace = Replace::new(ReplacePattern::Regex(r"\s+".into()), ' ').unwrap();
+        let replace = Replace::new(ReplacePattern::Regex(r"\s+".into()), " ").unwrap();
         let replace_s = r#"{"type":"Replace","pattern":{"Regex":"\\s+"},"content":" "}"#;
         assert_eq!(serde_json::to_string(&replace).unwrap(), replace_s);
         assert_eq!(serde_json::from_str::<Replace>(replace_s).unwrap(), replace);
